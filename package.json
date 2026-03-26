@@ -1,0 +1,20 @@
+{
+  "name": "appointment-reminder",
+  "version": "1.0.0",
+  "description": "Bot de Telegram para recordatorios personales con Supabase",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "chrono-node": "^2.7.0",
+    "dotenv": "^16.4.0",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
