@@ -9,8 +9,8 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
     "@supabase/supabase-js": "^2.39.0",
-    "chrono-node": "^2.7.0",
     "dotenv": "^16.4.0",
     "node-telegram-bot-api": "^0.66.0"
   },
