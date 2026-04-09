@@ -1,7 +1,9 @@
 // Módulo de parseo: usa Claude para interpretar eventos y recordatorios en español
 import Anthropic from '@anthropic-ai/sdk'
+import OpenAI, { toFile } from 'openai'
 
-const client = new Anthropic()
+const anthropic = new Anthropic()
+const openai = new OpenAI()
 const TIMEZONE = process.env.TIMEZONE || 'America/Argentina/Buenos_Aires'
 
 function nowInArgentina() {
@@ -12,66 +14,80 @@ function nowInArgentina() {
   })
 }
 
-// Devuelve { description, eventAt: Date, reminderAt: Date } o null
+// Transcribe un buffer de audio (OGG/MP4/etc.) a texto usando Whisper
+export async function transcribeAudio(buffer) {
+  const file = await toFile(buffer, 'voice.ogg', { type: 'audio/ogg' })
+  const result = await openai.audio.transcriptions.create({
+    file,
+    model: 'whisper-1',
+    language: 'es',
+  })
+  return result.text
+}
+
+// Devuelve un array de recordatorios [ { description, context, eventAt, reminderAt, recurrenceDays } ]
+// o null si no se pudo interpretar
 export async function parseReminder(text) {
   const prompt = `La fecha y hora actual en Argentina es: ${nowInArgentina()}
 
 El usuario escribió: "${text}"
 
-Extraé la información y respondé SOLO con JSON válido, sin explicaciones ni markdown:
-{
-  "description": "descripción breve del evento (qué hay que hacer, sin datos de contacto ni links)",
-  "context": "información adicional: teléfono, URL, número de caso, notas — o null si no hay",
-  "eventAt": "fecha/hora del evento en ISO 8601 con offset -03:00",
-  "reminderAt": "fecha/hora para enviar el aviso en ISO 8601 con offset -03:00",
-  "recurrenceDays": null
-}
+Extraé TODOS los recordatorios mencionados y respondé SOLO con un array JSON válido, sin explicaciones ni markdown.
+Si hay múltiples eventos, incluí uno por elemento del array.
+
+[
+  {
+    "description": "descripción breve del evento (qué hay que hacer, sin datos de contacto ni links)",
+    "context": "información adicional: teléfono, URL, número de caso, notas — o null si no hay",
+    "eventAt": "fecha/hora del evento en ISO 8601 con offset -03:00",
+    "reminderAt": "fecha/hora para enviar el aviso en ISO 8601 con offset -03:00",
+    "recurrenceDays": null
+  }
+]
 
 Reglas:
-- "description": solo el qué, sin detalles técnicos. Ej: "Llamar a Banco Galicia", "Turno médico"
+- "description": solo el qué. Ej: "Cortarme el pelo", "Entregar reporte"
 - "context": todo lo extra útil. Ej: "0800-333-1254", "https://...", "Caso #4421", null
-- "eventAt": cuándo ocurre el evento (la primera ocurrencia si es recurrente)
-- "reminderAt": cuándo avisar. Si el usuario dice "X tiempo antes", restá ese tiempo de eventAt. Si no especifica, igual a eventAt
-- "recurrenceDays": días entre repeticiones. null si no es recurrente. Ejemplos:
-    "todos los días" / "diariamente" → 1
-    "todas las semanas" / "todos los lunes" / "cada semana" → 7
-    "cada dos semanas" / "quincenal" → 14
-    "todos los meses" / "mensualmente" → 30
-- Zona horaria Argentina, offset -03:00 (no usar Z ni otro offset)
-- Si no se especifica hora del evento, usar 09:00-03:00
-- "el miércoles próximo", "este miércoles" = el miércoles más cercano hacia adelante
+- "eventAt": cuándo ocurre el evento (primera ocurrencia si es recurrente)
+- "reminderAt": cuándo avisar. Si dice "X tiempo antes", restá ese tiempo. Si no especifica, igual a eventAt
+- "recurrenceDays": null si no es recurrente. "todos los lunes"→7, "diariamente"→1, "quincenal"→14, "mensual"→30
+- Zona horaria Argentina, offset -03:00 (nunca Z ni otro offset)
+- Si no se especifica hora, usar 09:00-03:00
 - Si no podés interpretar el mensaje, respondé exactamente: null`
 
   try {
-    const response = await client.messages.create({
+    const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 300,
+      max_tokens: 800,
       messages: [{ role: 'user', content: prompt }],
     })
 
     const raw = response.content[0].text.trim()
-    // Remover bloques de código markdown si Claude los incluyó (ej: ```json ... ```)
     const content = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim()
     console.log('[parser] Respuesta de Claude:', content)
     if (content === 'null') return null
 
     const parsed = JSON.parse(content)
-    if (!parsed?.eventAt || !parsed?.reminderAt) return null
+    const items = Array.isArray(parsed) ? parsed : [parsed]
 
-    return {
-      description: parsed.description || text.trim(),
-      context: parsed.context || null,
-      eventAt: new Date(parsed.eventAt),
-      reminderAt: new Date(parsed.reminderAt),
-      recurrenceDays: parsed.recurrenceDays || null,
-    }
+    const result = items
+      .filter(item => item?.eventAt && item?.reminderAt)
+      .map(item => ({
+        description: item.description || '',
+        context: item.context || null,
+        eventAt: new Date(item.eventAt),
+        reminderAt: new Date(item.reminderAt),
+        recurrenceDays: item.recurrenceDays || null,
+      }))
+
+    return result.length > 0 ? result : null
   } catch (err) {
     console.error('[parser] Error al interpretar mensaje:', err.message)
     return null
   }
 }
 
-// Dado un mensaje del usuario y la lista de recordatorios actuales, devuelve los IDs a marcar como completados
+// Dado un mensaje y la lista de recordatorios, devuelve los IDs a marcar como completados
 export async function parseCompletedIds(text, reminders) {
   if (reminders.length === 0) return []
 
@@ -89,7 +105,7 @@ Ejemplos válidos: [1] o [1, 4, 7] o []
 Si no podés determinar cuáles marcar, respondé: []`
 
   try {
-    const response = await client.messages.create({
+    const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 100,
       messages: [{ role: 'user', content: prompt }],

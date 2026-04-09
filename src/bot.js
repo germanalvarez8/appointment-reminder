@@ -1,10 +1,10 @@
 // Módulo del bot: maneja todos los comandos y mensajes de Telegram
 import TelegramBot from 'node-telegram-bot-api'
-import { parseReminder, parseCompletedIds, formatDate } from './parser.js'
+import { parseReminder, parseCompletedIds, transcribeAudio, formatDate } from './parser.js'
 import { saveReminder, listReminders, deleteReminder, markAsCompleted, createNextOccurrence, snoozeReminder } from './db.js'
 
-// Estado temporal por chat para el flujo de confirmación
-// { chatId: { description, context, eventAt, reminderAt, recurrenceDays } }
+// Estado temporal por chat: siempre un array de items pendientes de confirmar
+// { chatId: [ { description, context, eventAt, reminderAt, recurrenceDays }, ... ] }
 const pendingConfirmations = new Map()
 
 function isCompletionMessage(text) {
@@ -20,11 +20,66 @@ function recurrenceLabel(days) {
   return `cada ${days} días`
 }
 
-const CONFIRM_KEYBOARD = {
-  inline_keyboard: [[
-    { text: '✅ Confirmar', callback_data: 'confirm_yes' },
-    { text: '❌ Cancelar', callback_data: 'confirm_no' },
-  ]],
+function buildConfirmMessage(items) {
+  if (items.length === 1) {
+    const { description, context, eventAt, reminderAt, recurrenceDays } = items[0]
+    const sameTime = Math.abs(eventAt - reminderAt) < 60000
+    const contextLine = context ? `\n📎 ${context}` : ''
+    const recurrLine = recurrenceDays ? `\nRepite: ${recurrenceLabel(recurrenceDays)}` : ''
+    return sameTime
+      ? `*${description}*${contextLine}\nEvento: ${formatDate(eventAt)}${recurrLine}`
+      : `*${description}*${contextLine}\nEvento: ${formatDate(eventAt)}\nAviso: ${formatDate(reminderAt)}${recurrLine}`
+  }
+
+  const lines = items.map((item, i) => {
+    const { description, context, eventAt, reminderAt, recurrenceDays } = item
+    const sameTime = Math.abs(eventAt - reminderAt) < 60000
+    const contextLine = context ? `\n   📎 ${context}` : ''
+    const recurrLine = recurrenceDays ? `\n   Repite: ${recurrenceLabel(recurrenceDays)}` : ''
+    const avisoLine = sameTime ? '' : `\n   Aviso: ${formatDate(reminderAt)}`
+    return `${i + 1}. *${description}*${contextLine}\n   Evento: ${formatDate(eventAt)}${avisoLine}${recurrLine}`
+  })
+  return `*${items.length} recordatorios:*\n\n${lines.join('\n\n')}`
+}
+
+function buildConfirmKeyboard(items) {
+  return {
+    inline_keyboard: [[
+      { text: items.length > 1 ? '✅ Confirmar todos' : '✅ Confirmar', callback_data: 'confirm_yes' },
+      { text: '❌ Cancelar', callback_data: 'confirm_no' },
+    ]],
+  }
+}
+
+async function saveAllPending(chatId, items) {
+  const saved = []
+  for (const item of items) {
+    const s = await saveReminder({
+      chatId,
+      description: item.description,
+      context: item.context,
+      eventAt: item.eventAt.toISOString(),
+      reminderAt: item.reminderAt.toISOString(),
+      recurrenceDays: item.recurrenceDays,
+    })
+    saved.push(s)
+  }
+  return saved
+}
+
+// Parsea texto y muestra la confirmación al usuario
+async function handleText(bot, chatId, text) {
+  const items = await parseReminder(text)
+
+  if (!items) {
+    return bot.sendMessage(chatId, 'No pude interpretar el mensaje. Intentá algo como:\n"El martes me corto el pelo a las 10 y a las 19 entrego el reporte"')
+  }
+
+  pendingConfirmations.set(chatId, items)
+  bot.sendMessage(chatId, buildConfirmMessage(items), {
+    parse_mode: 'Markdown',
+    reply_markup: buildConfirmKeyboard(items),
+  })
 }
 
 export function createBot(token) {
@@ -35,9 +90,10 @@ export function createBot(token) {
     const chatId = msg.chat.id
     bot.sendMessage(
       chatId,
-      `¡Hola! Soy tu bot de recordatorios.\n\n` +
-      `Escribime el evento y cuándo querés que te avise, por ejemplo:\n` +
-      `  • "El miércoles a las 15 debo responder al grupo de OPS, recuerdame una hora antes"\n` +
+      `¡Hola! Soy Barbara, tu asistente de recordatorios.\n\n` +
+      `Podés escribirme o mandarme un audio. Ejemplos:\n` +
+      `  • "El miércoles a las 15 respondo al grupo de OPS, recuerdame una hora antes"\n` +
+      `  • "El martes me corto el pelo a las 10 y a las 19 entrego el reporte"\n` +
       `  • "Llamar a Banco Galicia — 0800-333-1254, mañana a las 10"\n` +
       `  • "Todos los lunes a las 9 revisar métricas"\n\n` +
       `Para marcar como listo:\n` +
@@ -118,24 +174,20 @@ export function createBot(token) {
 
     try {
       if (data === 'confirm_yes') {
-        const pending = pendingConfirmations.get(chatId)
-        if (!pending) {
+        const items = pendingConfirmations.get(chatId)
+        if (!items) {
           return bot.answerCallbackQuery(query.id, { text: 'Esta confirmación ya expiró.' })
         }
         pendingConfirmations.delete(chatId)
 
-        const saved = await saveReminder({
-          chatId,
-          description: pending.description,
-          context: pending.context,
-          eventAt: pending.eventAt.toISOString(),
-          reminderAt: pending.reminderAt.toISOString(),
-          recurrenceDays: pending.recurrenceDays,
-        })
-        const recurMsg = saved.recurrence_days ? ` Se repite ${recurrenceLabel(saved.recurrence_days)}.` : ''
-        await bot.answerCallbackQuery(query.id, { text: `Guardado #${saved.id}` })
+        const saved = await saveAllPending(chatId, items)
+        const ids = saved.map(s => `#${s.id}`).join(', ')
+        await bot.answerCallbackQuery(query.id, { text: `Guardados: ${ids}` })
         await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId })
-        bot.sendMessage(chatId, `Guardado con ID #${saved.id}.${recurMsg} Te aviso en el momento indicado.`)
+        const msg = saved.length === 1
+          ? `Guardado con ID #${saved[0].id}. Te aviso en el momento indicado.`
+          : `Guardados ${ids}. Te aviso en cada momento indicado.`
+        bot.sendMessage(chatId, msg)
 
       } else if (data === 'confirm_no') {
         pendingConfirmations.delete(chatId)
@@ -153,7 +205,6 @@ export function createBot(token) {
             toastText = `✅ Listo. Próximo aviso: ${formatDate(new Date(next.reminder_at))}`
           }
         }
-
         await bot.answerCallbackQuery(query.id, { text: toastText })
         await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId })
 
@@ -163,7 +214,6 @@ export function createBot(token) {
         const id = parseInt(parts[2], 10)
 
         await snoozeReminder(id, chatId, minutes)
-
         const label = minutes < 60 ? `${minutes} min` : minutes === 60 ? '1 hora' : 'mañana'
         await bot.answerCallbackQuery(query.id, { text: `⏰ Pospuesto ${label}` })
         await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: messageId })
@@ -174,33 +224,45 @@ export function createBot(token) {
     }
   })
 
-  // Mensajes de texto libre
+  // Mensajes de texto y voz
   bot.on('message', async (msg) => {
     const chatId = msg.chat.id
-    const text = msg.text?.trim()
 
+    // Mensaje de voz
+    if (msg.voice || msg.audio) {
+      const fileId = (msg.voice || msg.audio).file_id
+      try {
+        const fileLink = await bot.getFileLink(fileId)
+        const response = await fetch(fileLink)
+        const buffer = Buffer.from(await response.arrayBuffer())
+        const transcribed = await transcribeAudio(buffer)
+        console.log(`[voice] Transcripción: "${transcribed}"`)
+        bot.sendMessage(chatId, `_Entendí: "${transcribed}"_`, { parse_mode: 'Markdown' })
+        await handleText(bot, chatId, transcribed)
+      } catch (err) {
+        console.error('Error procesando audio:', err.message)
+        bot.sendMessage(chatId, 'No pude procesar el audio. Intentá de nuevo o escribí el recordatorio.')
+      }
+      return
+    }
+
+    const text = msg.text?.trim()
     if (!text || text.startsWith('/')) return
 
-    // Flujo de confirmación activo por texto (fallback si el usuario escribe en lugar de tocar el botón)
+    // Flujo de confirmación activo (fallback por texto)
     if (pendingConfirmations.has(chatId)) {
       const lower = text.toLowerCase()
       if (['si', 'sí', 's', 'yes', 'ok', 'dale', 'correcto'].some(w => lower.includes(w))) {
-        // Simular tap en confirmar
-        const pending = pendingConfirmations.get(chatId)
+        const items = pendingConfirmations.get(chatId)
         pendingConfirmations.delete(chatId)
         try {
-          const saved = await saveReminder({
-            chatId,
-            description: pending.description,
-            context: pending.context,
-            eventAt: pending.eventAt.toISOString(),
-            reminderAt: pending.reminderAt.toISOString(),
-            recurrenceDays: pending.recurrenceDays,
-          })
-          const recurMsg = saved.recurrence_days ? ` Se repite ${recurrenceLabel(saved.recurrence_days)}.` : ''
-          bot.sendMessage(chatId, `Guardado con ID #${saved.id}.${recurMsg} Te aviso en el momento indicado.`)
+          const saved = await saveAllPending(chatId, items)
+          const ids = saved.map(s => `#${s.id}`).join(', ')
+          bot.sendMessage(chatId, saved.length === 1
+            ? `Guardado con ID #${saved[0].id}. Te aviso en el momento indicado.`
+            : `Guardados ${ids}. Te aviso en cada momento indicado.`)
         } catch (err) {
-          console.error('Error guardando recordatorio:', err.message)
+          console.error('Error guardando recordatorios:', err.message)
           bot.sendMessage(chatId, 'Hubo un error al guardar. Intentá de nuevo.')
         }
       } else if (['no', 'n', 'cancelar', 'cancel'].some(w => lower.includes(w))) {
@@ -212,19 +274,17 @@ export function createBot(token) {
       return
     }
 
-    // Detectar si el mensaje indica que algo fue completado
+    // Detectar si el mensaje indica compleción
     if (isCompletionMessage(text)) {
       try {
         const reminders = await listReminders(chatId)
         if (reminders.length === 0) {
           return bot.sendMessage(chatId, 'No tenés recordatorios pendientes para marcar.')
         }
-
         const ids = await parseCompletedIds(text, reminders)
         if (ids.length === 0) {
           return bot.sendMessage(chatId, 'No pude identificar qué recordatorios marcar. Usá /list para ver los IDs y luego /done ID.')
         }
-
         const updated = await markAsCompleted(ids, chatId)
         for (const r of updated) {
           if (r.recurrence_days) await createNextOccurrence(r)
@@ -237,25 +297,8 @@ export function createBot(token) {
       return
     }
 
-    // Parsear como nuevo recordatorio
-    const parsed = await parseReminder(text)
-
-    if (!parsed) {
-      bot.sendMessage(chatId, 'No pude interpretar el mensaje. Intentá algo como:\n"El miércoles a las 15 debo responder al grupo de OPS, recuerdame una hora antes"')
-      return
-    }
-
-    const { description, context, eventAt, reminderAt, recurrenceDays } = parsed
-    const sameTime = Math.abs(eventAt - reminderAt) < 60000
-    const contextLine = context ? `\n📎 ${context}` : ''
-    const recurrLine = recurrenceDays ? `\nRepite: ${recurrenceLabel(recurrenceDays)}` : ''
-
-    const confirmMsg = sameTime
-      ? `*${description}*${contextLine}\nEvento: ${formatDate(eventAt)}${recurrLine}`
-      : `*${description}*${contextLine}\nEvento: ${formatDate(eventAt)}\nAviso: ${formatDate(reminderAt)}${recurrLine}`
-
-    pendingConfirmations.set(chatId, { description, context, eventAt, reminderAt, recurrenceDays })
-    bot.sendMessage(chatId, confirmMsg, { parse_mode: 'Markdown', reply_markup: CONFIRM_KEYBOARD })
+    // Parsear como nuevo/s recordatorio/s
+    await handleText(bot, chatId, text)
   })
 
   return bot
