@@ -3,6 +3,15 @@ import TelegramBot from 'node-telegram-bot-api'
 import { parseReminder, parseCompletedIds, formatDate } from './parser.js'
 import { saveReminder, listReminders, deleteReminder, markAsCompleted, createNextOccurrence, snoozeReminder } from './db.js'
 
+// Whitelist de chat IDs autorizados (vacía = todos permitidos)
+const ALLOWED_CHAT_IDS = process.env.ALLOWED_CHAT_IDS
+  ? new Set(process.env.ALLOWED_CHAT_IDS.split(',').map(s => parseInt(s.trim(), 10)))
+  : null
+
+function isAllowed(chatId) {
+  return !ALLOWED_CHAT_IDS || ALLOWED_CHAT_IDS.has(chatId)
+}
+
 // Estado temporal por chat para el flujo de confirmación
 // { chatId: { description, context, eventAt, reminderAt, recurrenceDays } }
 const pendingConfirmations = new Map()
@@ -30,9 +39,12 @@ const CONFIRM_KEYBOARD = {
 export function createBot(token) {
   const bot = new TelegramBot(token, { polling: true })
 
-  // /start - bienvenida
+  // /start - bienvenida (responde a todos para dar feedback claro)
   bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id
+    if (!isAllowed(chatId)) {
+      return bot.sendMessage(chatId, 'No tenés acceso a este bot.')
+    }
     bot.sendMessage(
       chatId,
       `¡Hola! Soy tu bot de recordatorios.\n\n` +
@@ -52,6 +64,7 @@ export function createBot(token) {
   // /list - listar recordatorios pendientes
   bot.onText(/\/list/, async (msg) => {
     const chatId = msg.chat.id
+    if (!isAllowed(chatId)) return
     try {
       const reminders = await listReminders(chatId)
 
@@ -78,6 +91,7 @@ export function createBot(token) {
   // /done ID ID... - marcar como listos por ID
   bot.onText(/\/done (.+)/, async (msg, match) => {
     const chatId = msg.chat.id
+    if (!isAllowed(chatId)) return
     const ids = match[1].split(/[\s,]+/).map(Number).filter(n => !isNaN(n) && n > 0)
 
     if (ids.length === 0) {
@@ -99,6 +113,7 @@ export function createBot(token) {
   // /delete ID - eliminar recordatorio
   bot.onText(/\/delete (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id
+    if (!isAllowed(chatId)) return
     const id = parseInt(match[1], 10)
 
     try {
@@ -116,6 +131,7 @@ export function createBot(token) {
     const messageId = query.message.message_id
     const data = query.data
 
+    if (!isAllowed(chatId)) return bot.answerCallbackQuery(query.id)
     try {
       if (data === 'confirm_yes') {
         const pending = pendingConfirmations.get(chatId)
@@ -180,6 +196,7 @@ export function createBot(token) {
     const text = msg.text?.trim()
 
     if (!text || text.startsWith('/')) return
+    if (!isAllowed(chatId)) return
 
     // Flujo de confirmación activo por texto (fallback si el usuario escribe en lugar de tocar el botón)
     if (pendingConfirmations.has(chatId)) {
